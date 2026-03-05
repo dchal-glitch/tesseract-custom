@@ -3,6 +3,7 @@ use serde_derive::{Serialize, Deserialize};
 use lazy_static::lazy_static;
 use log::*;
 use serde_qs as qs;
+use std::thread;
 
 use actix_web::{
     HttpRequest,
@@ -11,6 +12,7 @@ use actix_web::{
 };
 
 use crate::app::{AppState, SchemaSource};
+use crate::logic_layer;
 use crate::schema_config;
 
 
@@ -45,8 +47,8 @@ pub fn flush_handler(req: HttpRequest<AppState>) -> ActixResult<HttpResponse> {
         // Read schema again
         // NOTE: This logic will change once we start supporting remote schemas
         let schema_path = match &req.state().env_vars.schema_source {
-            SchemaSource::LocalSchema { ref filepath } => filepath,
-            SchemaSource::RemoteSchema { ref endpoint } => endpoint,
+            SchemaSource::LocalSchema { ref filepath } => filepath.clone(),
+            SchemaSource::RemoteSchema { ref endpoint } => endpoint.clone(),
         };
 
         let schema = match schema_config::read_schema(&schema_path) {
@@ -58,22 +60,44 @@ pub fn flush_handler(req: HttpRequest<AppState>) -> ActixResult<HttpResponse> {
         };
 
         // Update shared schema
-        let mut w = req.state().schema.write().unwrap();
-        *w = schema.clone();
+        {
+            let mut w = req.state().schema.write().unwrap();
+            *w = schema.clone();
+        }
 
-        // TODO: Uncomment when issue with SystemRunner is solved
-//        // Re-populate cache with the new schema
-//        let cache = match populate_cache(schema, req.state().backend.clone()) {
-//            Ok(cache) => cache,
-//            Err(err) => {
-//                error!("{}", err);
-//                return Ok(HttpResponse::InternalServerError().finish());
-//            },
-//        };
-//
-//        // Update shared cache
-//        let mut w = req.state().cache.write().unwrap();
-//        *w = cache;
+        // Re-populate cache in a separate thread with its own actix System.
+        // We cannot block_on from within the request handler (same runtime = deadlock),
+        // so we spawn a thread that creates a fresh System for cache population.
+        let backend = req.state().backend.clone();
+        let logic_layer_config = req.state().logic_layer_config.as_ref()
+            .and_then(|arc| arc.read().ok())
+            .map(|guard| (*guard).clone());
+        let cache_arc = req.state().cache.clone();
+
+        let handle = thread::spawn(move || {
+            let mut sys = actix::System::new("flush-cache");
+            match logic_layer::populate_cache(
+                schema,
+                &logic_layer_config,
+                backend,
+                &mut sys,
+            ) {
+                Ok(cache) => {
+                    if let Ok(mut w) = cache_arc.write() {
+                        *w = cache;
+                        info!("Cache repopulated successfully");
+                    }
+                }
+                Err(err) => {
+                    error!("Cache repopulation failed: {}", err);
+                }
+            }
+        });
+
+        if let Err(e) = handle.join() {
+            error!("Flush thread panicked: {:?}", e);
+            return Ok(HttpResponse::InternalServerError().finish());
+        }
 
         Ok(HttpResponse::Ok().finish())
     } else {
